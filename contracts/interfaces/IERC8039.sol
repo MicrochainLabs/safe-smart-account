@@ -7,7 +7,7 @@ pragma solidity >=0.7.0 <0.9.0;
  * @dev This interface standardizes proof verification for smart contracts,
  *      similar to how ERC-1271 standardizes signature verification.
  *      
- *      Contracts implementing this interface can act as "provers" in a Safe,
+ *      Contracts implementing this interface can act as "verifiers" in a Safe,
  *      providing ZK proofs or other cryptographic proofs instead of signatures.
  *      
  *      Signature Type: v = 2 in Safe's checkNSignatures
