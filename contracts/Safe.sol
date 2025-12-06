@@ -14,6 +14,7 @@ import {SafeMath} from "./external/SafeMath.sol";
 import {ISafe} from "./interfaces/ISafe.sol";
 import {ISignatureValidator, ISignatureValidatorConstants} from "./interfaces/ISignatureValidator.sol";
 import {Enum} from "./libraries/Enum.sol";
+import {IERC8039} from "./interfaces/IERC8039.sol";
 
 /**
  * @title Safe - A multisignature wallet with support for confirmations using signed messages based on EIP-712.
@@ -50,6 +51,22 @@ contract Safe is
     using SafeMath for uint256;
 
     string public constant override VERSION = "1.5.0";
+
+    /**
+     * @dev Struct to hold transaction parameters for ERC-8039 proof verification.
+     *      Used to pass transaction context to checkContractProof without stack overflow.
+     */
+    struct SafeTxParams {
+        address to;
+        uint256 value;
+        bytes32 dataHash;      // keccak256(data)
+        uint8 operation;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        address gasToken;
+        address refundReceiver;
+    }
 
     // keccak256(
     //     "EIP712Domain(uint256 chainId,address verifyingContract)"
@@ -144,7 +161,24 @@ contract Safe is
                 // We use the post-increment here, so the current nonce value is used and incremented afterwards.
                 nonce++
             );
-            checkSignatures(msg.sender, txHash, signatures);
+            
+            // Build transaction params for ERC-8039 proof verification
+            SafeTxParams memory txParams = SafeTxParams({
+                to: to,
+                value: value,
+                dataHash: keccak256(data),
+                operation: uint8(operation),
+                safeTxGas: safeTxGas,
+                baseGas: baseGas,
+                gasPrice: gasPrice,
+                gasToken: gasToken,
+                refundReceiver: refundReceiver
+            });
+            
+            // Check signatures with full transaction context
+            uint256 _threshold = threshold;
+            if (_threshold == 0) revertWithError("GS001");
+            _checkNSignaturesWithContext(msg.sender, txHash, txParams, signatures, _threshold);
         }
         address guard = getGuard();
         {
@@ -271,6 +305,71 @@ contract Safe is
     }
 
     /**
+     * @notice Checks whether the contract proof is valid (ERC-8039). Reverts otherwise.
+     * @dev This function verifies proofs for signature type v = 2 using ERC-8039 standard.
+     *      The owner address IS the prover contract that implements IERC8039.
+     *      
+     *      Proof data format at offset: [length (32 bytes)][proof bytes]
+     *      
+     *      Similar to ERC-1271 for signatures, ERC-8039 standardizes proof verification:
+     *      - v=0: Contract Signature (ERC-1271) - isValidSignature(hash, signature)
+     *      - v=2: Contract Proof (ERC-8039) - isValidProof(publicInputs, proof)
+     *      
+     *      Public inputs include all transaction details:
+     *      [0] to, [1] value, [2] dataHash, [3] operation, [4] safeTxGas,
+     *      [5] baseGas, [6] gasPrice, [7] gasToken, [8] refundReceiver
+     *      
+     * @param owner Address of the owner contract that implements IERC8039
+     * @param txParams Transaction parameters struct containing all tx details
+     * @param signatures Signature data that should be verified.
+     * @param offset Offset to the start of the proof data in the signatures byte array
+     */
+    function checkContractProof(address owner, SafeTxParams memory txParams, bytes memory signatures, uint256 offset) internal view {
+        // Check that proof data pointer (s) is in bounds (points to the length of data -> 32 bytes)
+        if (offset.add(32) > signatures.length) revertWithError("GS041");
+
+        // Read the proof length
+        uint256 proofLen;
+        /* solhint-disable no-inline-assembly */
+        /// @solidity memory-safe-assembly
+        assembly {
+            proofLen := mload(add(add(signatures, offset), 0x20))
+        }
+        /* solhint-enable no-inline-assembly */
+
+        // Check if the proof data is in bounds
+        if (offset.add(32).add(proofLen) > signatures.length) revertWithError("GS042");
+
+        // Extract the proof bytes
+        bytes memory contractProof;
+        /* solhint-disable no-inline-assembly */
+        /// @solidity memory-safe-assembly
+        assembly {
+            // The proof data for contract proofs is appended to the concatenated signatures
+            contractProof := add(add(signatures, offset), 0x20)
+        }
+        /* solhint-enable no-inline-assembly */
+
+        // Build publicInputs array with all transaction details
+        // [0] to, [1] value, [2] dataHash, [3] operation, [4] safeTxGas,
+        // [5] baseGas, [6] gasPrice, [7] gasToken, [8] refundReceiver
+        bytes32[] memory publicInputs = new bytes32[](9);
+        publicInputs[0] = bytes32(uint256(uint160(txParams.to)));
+        publicInputs[1] = bytes32(txParams.value);
+        publicInputs[2] = txParams.dataHash;
+        publicInputs[3] = bytes32(uint256(txParams.operation));
+        publicInputs[4] = bytes32(txParams.safeTxGas);
+        publicInputs[5] = bytes32(txParams.baseGas);
+        publicInputs[6] = bytes32(txParams.gasPrice);
+        publicInputs[7] = bytes32(uint256(uint160(txParams.gasToken)));
+        publicInputs[8] = bytes32(uint256(uint160(txParams.refundReceiver)));
+
+        // Verify the proof using ERC-8039 - owner IS the prover contract
+        // ERC8039_MAGIC_VALUE = bytes4(keccak256("isValidProof(bytes32[],bytes)")) = 0xe7927420
+        if (IERC8039(owner).isValidProof(publicInputs, contractProof) != bytes4(0xe7927420)) revertWithError("GS043");
+    }
+
+    /**
      * @inheritdoc ISafe
      */
     function checkSignatures(address executor, bytes32 dataHash, bytes memory signatures) public view override {
@@ -290,6 +389,26 @@ contract Safe is
         bytes memory signatures,
         uint256 requiredSignatures
     ) public view override {
+        // Create empty SafeTxParams for backward compatibility (v=2 proofs won't work without context)
+        SafeTxParams memory emptyParams;
+        _checkNSignaturesWithContext(executor, dataHash, emptyParams, signatures, requiredSignatures);
+    }
+
+    /**
+     * @notice Internal function to check N signatures with full transaction context for ERC-8039 proofs.
+     * @param executor Address that is executing the transaction (used for approved hash check)
+     * @param dataHash Hash of the transaction data
+     * @param txParams Transaction parameters for ERC-8039 proof verification
+     * @param signatures Packed signature data
+     * @param requiredSignatures Number of required signatures
+     */
+    function _checkNSignaturesWithContext(
+        address executor,
+        bytes32 dataHash,
+        SafeTxParams memory txParams,
+        bytes memory signatures,
+        uint256 requiredSignatures
+    ) internal view {
         // Check that the provided signature data is not too short
         if (signatures.length < requiredSignatures.mul(65)) revertWithError("GS020");
         // There cannot be an owner with address 0.
@@ -326,6 +445,16 @@ contract Safe is
                 currentOwner = address(uint160(uint256(r)));
                 // Hashes are automatically approved by the sender of the message or when they have been pre-approved via a separate transaction
                 if (executor != currentOwner && approvedHashes[currentOwner][dataHash] == 0) revertWithError("GS025");
+            } else if (v == 2) {
+                // If v is 2 then it is a contract ZK proof (ERC-8039)
+                // When handling contract proofs the address of the owner/verifier contract is encoded into r
+                currentOwner = address(uint160(uint256(r)));
+
+                // Check that proof data pointer (s) is not pointing inside the static part of the signatures bytes
+                if (uint256(s) < requiredSignatures.mul(65)) revertWithError("GS021");
+
+                // Verify the ZK proof with full transaction context - owner address is the verifier contract
+                checkContractProof(currentOwner, txParams, signatures, uint256(s));
             } else if (v > 30) {
                 // If v > 30 then default va (27,28) has been adjusted for eth_sign flow
                 // To support eth_sign and similar we adjust v and hash the messageHash with the Ethereum message prefix before applying ecrecover
